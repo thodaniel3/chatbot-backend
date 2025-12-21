@@ -1,3 +1,4 @@
+// server.js (robust + auto-process existing bucket files)
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
@@ -10,127 +11,200 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// 🔒 Multer (memory upload)
-const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 10 * 1024 * 1024 } // 10MB
-});
+// Multer in-memory storage
+const upload = multer({ storage: multer.memoryStorage() });
 
-// 🔑 USE SERVICE ROLE KEY (THIS FIXES IT)
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY,
-  { auth: { persistSession: false } }
-);
+// Supabase client
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
-// ---------- TOKENIZER ----------
+// Stopwords
 const STOPWORDS = new Set([
-  'the','is','and','a','an','of','to','in','for','on','by','with','that','this',
-  'it','are','as','be','or','from','at','which','we','you','your','our','their'
+  'the','is','and','a','an','of','to','in','for','on','by','with','that','this','it','are','as','be','or',
+  'from','at','which','we','you','your','our','their','has','have','was','were','but','not'
 ]);
 
-function tokenize(text) {
+function simpleTokenize(text) {
   if (!text) return [];
-  return [...new Set(
-    text.toLowerCase()
-      .replace(/[^a-z0-9\s]/g, ' ')
-      .split(/\s+/)
-      .filter(w => w.length > 2 && !STOPWORDS.has(w))
-  )].slice(0, 200);
+  const raw = String(text).toLowerCase().replace(/[^a-z0-9\s]/g, ' ');
+  const words = raw.split(/\s+/).filter(Boolean);
+  return Array.from(new Set(words.filter(w => !STOPWORDS.has(w) && w.length > 2))).slice(0, 200);
 }
 
-// ---------- FILE PROCESSOR ----------
-async function processFile({ file, lecturer = '', keywords = '' }) {
-
-  const safeName = `${Date.now()}_${file.originalname.replace(/\s+/g, '_')}`;
-
-  // 1️⃣ Upload to Storage
-  const { error: uploadError } = await supabase.storage
-    .from('documents')
-    .upload(safeName, file.buffer, {
-      contentType: file.mimetype,
-      upsert: true
-    });
-
-  if (uploadError) {
-    console.error("STORAGE ERROR:", uploadError);
-    throw new Error(uploadError.message);
-  }
-
-  // 2️⃣ Public URL
-  const { data } = supabase.storage
-    .from('documents')
-    .getPublicUrl(safeName);
-
-  const publicUrl = data.publicUrl;
-
-  // 3️⃣ Extract text
-  let extractedText = '';
-  if (file.mimetype === 'application/pdf') {
-    extractedText = (await pdfParse(file.buffer)).text;
-  } else if (file.mimetype.includes('word')) {
-    extractedText = (await mammoth.extractRawText({ buffer: file.buffer })).value;
-  } else {
-    extractedText = file.buffer.toString('utf8');
-  }
-
-  // 4️⃣ Keywords
-  const keywordList = tokenize(
-    extractedText + ' ' + file.originalname + ' ' + keywords
-  ).join(',');
-
-  // 5️⃣ Save DB
-  const { error: dbError } = await supabase
-    .from('knowledge_base')
-    .insert([{
-      question_keywords: keywordList,
-      answer_text: extractedText.substring(0, 20000),
-      file_url: publicUrl,
-      lecturer_name: lecturer,
-      source_document: file.originalname
-    }]);
-
-  if (dbError) throw new Error(dbError.message);
-}
-
-// ---------- UPLOAD ----------
-app.post('/upload', upload.single('file'), async (req, res) => {
+// Helper: get public URL safely
+function getPublicUrlSafe(bucket, path) {
   try {
-    if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+    const maybe = supabase.storage.from(bucket).getPublicUrl(path);
+    if (maybe && maybe.data && (maybe.data.publicUrl || maybe.data.publicURL)) return maybe.data.publicUrl || maybe.data.publicURL;
+    if (maybe && (maybe.publicUrl || maybe.publicURL)) return maybe.publicUrl || maybe.publicURL;
+  } catch (e) { console.warn('getPublicUrlSafe warning:', e?.message || e); }
+  return '';
+}
 
-    await processFile({
-      file: req.file,
-      lecturer: req.body.lecturer,
-      keywords: req.body.keywords
+// Allowed types
+const ALLOWED_TYPES = {
+  pdf: 'application/pdf',
+  docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  csv: 'text/csv',
+  txt: 'text/plain'
+};
+
+// ===== FILE PROCESSOR (for new or existing files) =====
+async function processFile({ buffer, filename, mimetype, uploaded_by = 'system', lecturer_name = '', source_document = '', customKeywords = '' }) {
+  // 1) Upload file to storage (if buffer exists)
+  let filePath = filename;
+  if (buffer) {
+    const safeFilename = `${Date.now()}_${filename.replace(/\s+/g, '_')}`;
+    const { data: uploadData, error: uploadError } = await supabase
+      .storage
+      .from('documents')
+      .upload(safeFilename, buffer, { contentType: mimetype, upsert: true });
+
+    if (uploadError) console.warn('Storage upload error (continuing):', uploadError.message || uploadError);
+    else filePath = uploadData.path || uploadData.fullPath || safeFilename;
+  }
+
+  // 2) Get public URL
+  const publicUrl = getPublicUrlSafe('documents', filePath) || '';
+
+  // 3) Extract text
+  let extractedText = '';
+  try {
+    const lower = filename.toLowerCase();
+    if (mimetype === ALLOWED_TYPES.pdf || lower.endsWith('.pdf')) {
+      const pdfResult = await pdfParse(buffer || Buffer.from(''));
+      extractedText = pdfResult?.text || '';
+    } else if (mimetype === ALLOWED_TYPES.docx || lower.endsWith('.docx')) {
+      const docResult = await mammoth.extractRawText({ buffer: buffer || Buffer.from('') });
+      extractedText = docResult?.value || '';
+    } else if (mimetype === ALLOWED_TYPES.csv || lower.endsWith('.csv') || lower.endsWith('.txt') || mimetype === ALLOWED_TYPES.txt) {
+      extractedText = buffer ? buffer.toString('utf8') : '';
+    }
+  } catch (err) {
+    console.warn('File parsing failed (continuing):', err?.message || err);
+    extractedText = '';
+  }
+
+  // 4) Generate keywords
+  const keywordsArr = simpleTokenize(`${extractedText} ${filename} ${source_document} ${customKeywords}`);
+  const keywordString = keywordsArr.join(',');
+
+  // 5) Prepare DB payload
+  const payload = {
+    question_keywords: keywordString || '',
+    answer_text: (extractedText || '').substring(0, 20000),
+    file_url: publicUrl || '',
+    uploaded_by: uploaded_by || '',
+    lecturer_name: lecturer_name || '',
+    source_document: source_document || ''
+  };
+
+  // 6) Insert into DB
+  try {
+    const { data, error } = await supabase.from('knowledge_base').insert([payload]).select();
+    if (error) console.warn('DB insert failed (continuing):', error.message || error);
+    return data?.[0] || null;
+  } catch (err) {
+    console.warn('DB insert exception (continuing):', err?.message || err);
+    return null;
+  }
+}
+
+// ===== UPLOAD ENDPOINT =====
+app.post('/upload', upload.single('file'), async (req, res) => {
+  if (!req.file) return res.status(400).json({ ok: false, error: 'No file uploaded' });
+
+  const { originalname, buffer, mimetype } = req.file;
+  let { uploaded_by = '', lecturer = '', source_document = '', keywords = '' } = req.body || {};
+
+  const record = await processFile({
+    buffer, filename: originalname, mimetype,
+    uploaded_by, lecturer_name: lecturer, source_document, customKeywords: keywords
+  });
+
+  if (!record) return res.status(500).json({ ok: false, error: 'Processing failed' });
+  res.json({ ok: true, record });
+});
+
+// ===== ASK ENDPOINT =====
+app.post('/ask', async (req, res) => {
+  try {
+    const { question, top_k = 3 } = req.body;
+    if (!question) return res.status(400).json({ error: 'Question required' });
+
+    const qTokens = simpleTokenize(question).slice(0, 20);
+    if (qTokens.length === 0) return res.json({ matches: [] });
+
+    const orParts = [];
+    qTokens.forEach(tok => {
+      const safe = tok.replace(/%/g, '');
+      orParts.push(`question_keywords.ilike.%${safe}%`);
+      orParts.push(`answer_text.ilike.%${safe}%`);
+      orParts.push(`source_document.ilike.%${safe}%`);
+    });
+    const orQuery = orParts.join(',');
+
+    const { data, error } = await supabase.from('knowledge_base').select('*').or(orQuery).limit(200);
+    if (error) return res.status(500).json({ error: 'Search failed', detail: error });
+
+    const scored = data.map(r => {
+      const hay = ((r.answer_text || '') + ' ' + (r.question_keywords || '') + ' ' + (r.source_document || '')).toLowerCase();
+      let score = 0;
+      qTokens.forEach(tok => {
+        const re = new RegExp(`\\b${tok}\\b`, 'g');
+        const m = hay.match(re);
+        if (m) score += m.length;
+      });
+      return { row: r, score };
+    }).filter(x => x.score > 0).sort((a, b) => b.score - a.score);
+
+    const best = scored.slice(0, top_k).map(s => {
+      const r = s.row;
+      return {
+        score: s.score,
+        snippet: (r.answer_text || '').slice(0, 800),
+        lecturer: r.lecturer_name,
+        source: r.source_document,
+        file_url: r.file_url,
+        id: r.id
+      };
     });
 
-    res.json({ ok: true });
+    res.json({ matches: best });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: err.message });
+    console.error('[ask] error:', err?.message || err);
+    res.status(500).json({ error: 'Server error', detail: err?.message || String(err) });
   }
 });
 
-// ---------- ASK ----------
-app.post('/ask', async (req, res) => {
-  const tokens = tokenize(req.body.question || '');
-  const orQuery = tokens.map(t => `question_keywords.ilike.%${t}%`).join(',');
+// ===== PROCESS ALL EXISTING BUCKET FILES ON STARTUP =====
+async function processExistingFiles() {
+  try {
+    const { data: files, error } = await supabase.storage.from('documents').list('');
+    if (error) return console.warn('Error listing bucket files:', error.message || error);
 
-  const { data } = await supabase
-    .from('knowledge_base')
-    .select('*')
-    .or(orQuery)
-    .limit(5);
+    for (const f of files || []) {
+      if (!f.name) continue;
+      console.log('Processing existing file:', f.name);
+      // Download file buffer
+      const { data: fileData, error: downloadError } = await supabase.storage.from('documents').download(f.name);
+      if (downloadError) {
+        console.warn('Failed to download file:', f.name, downloadError.message || downloadError);
+        continue;
+      }
+      await processFile({
+        buffer: fileData,
+        filename: f.name,
+        mimetype: f.content_type || '',
+        uploaded_by: 'system'
+      });
+    }
+    console.log('Finished processing existing files.');
+  } catch (err) {
+    console.warn('Error in processExistingFiles:', err?.message || err);
+  }
+}
 
-  res.json({
-    matches: data.map(r => ({
-      snippet: r.answer_text.slice(0, 800),
-      lecturer: r.lecturer_name,
-      source: r.source_document,
-      file_url: r.file_url
-    }))
-  });
-});
+processExistingFiles(); // run on startup
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`✅ Server running on ${PORT}`));
+app.listen(PORT, () => console.log(`Chatbot backend running on port ${PORT}`));
