@@ -15,7 +15,10 @@ app.use(express.json());
 const upload = multer({ storage: multer.memoryStorage() });
 
 // Supabase client
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
+
+
+
 
 // Stopwords
 const STOPWORDS = new Set([
@@ -27,7 +30,7 @@ function simpleTokenize(text) {
   if (!text) return [];
   const raw = String(text).toLowerCase().replace(/[^a-z0-9\s]/g, ' ');
   const words = raw.split(/\s+/).filter(Boolean);
-  return Array.from(new Set(words.filter(w => !STOPWORDS.has(w) && w.length > 2))).slice(0, 200);
+  return Array.from(new Set(words.filter(w => !STOPWORDS.has(w) && w.length > 2))).slice(0, 2000);
 }
 
 // Helper: get public URL safely
@@ -59,7 +62,11 @@ async function processFile({ buffer, filename, mimetype, uploaded_by = 'system',
       .from('documents')
       .upload(safeFilename, buffer, { contentType: mimetype, upsert: true });
 
-    if (uploadError) console.warn('Storage upload error (continuing):', uploadError.message || uploadError);
+    if (uploadError) {
+  console.error("❌ STORAGE UPLOAD FAILED:", uploadError);
+  throw uploadError; // stop processing
+}
+
     else filePath = uploadData.path || uploadData.fullPath || safeFilename;
   }
 
@@ -128,10 +135,10 @@ app.post('/upload', upload.single('file'), async (req, res) => {
 // ===== ASK ENDPOINT =====
 app.post('/ask', async (req, res) => {
   try {
-    const { question, top_k = 3 } = req.body;
+    const { question, top_k = 2 } = req.body;
     if (!question) return res.status(400).json({ error: 'Question required' });
 
-    const qTokens = simpleTokenize(question).slice(0, 20);
+    const qTokens = simpleTokenize(question).slice(0, 2000);
     if (qTokens.length === 0) return res.json({ matches: [] });
 
     const orParts = [];
@@ -143,7 +150,7 @@ app.post('/ask', async (req, res) => {
     });
     const orQuery = orParts.join(',');
 
-    const { data, error } = await supabase.from('knowledge_base').select('*').or(orQuery).limit(200);
+    const { data, error } = await supabase.from('knowledge_base').select('*').or(orQuery).limit(2000);
     if (error) return res.status(500).json({ error: 'Search failed', detail: error });
 
     const scored = data.map(r => {
@@ -161,7 +168,7 @@ app.post('/ask', async (req, res) => {
       const r = s.row;
       return {
         score: s.score,
-        snippet: (r.answer_text || '').slice(0, 800),
+        snippet: (r.answer_text || '').slice(0, 8000),
         lecturer: r.lecturer_name,
         source: r.source_document,
         file_url: r.file_url,
