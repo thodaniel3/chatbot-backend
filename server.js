@@ -128,7 +128,7 @@ app.post('/upload', upload.single('file'), async (req, res) => {
 // ===== ASK ENDPOINT =====
 app.post('/ask', async (req, res) => {
   try {
-    const { question, top_k = 3 } = req.body;
+    const { question, top_k = 2 } = req.body;
     if (!question) return res.status(400).json({ error: 'Question required' });
 
     const qTokens = simpleTokenize(question).slice(0, 20);
@@ -161,7 +161,7 @@ app.post('/ask', async (req, res) => {
       const r = s.row;
       return {
         score: s.score,
-        snippet: (r.answer_text || '').slice(0, 800),
+        snippet: (r.answer_text || '').slice(0, 8000),
         lecturer: r.lecturer_name,
         source: r.source_document,
         file_url: r.file_url,
