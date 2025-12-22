@@ -125,15 +125,25 @@ app.post('/upload', upload.single('file'), async (req, res) => {
   res.json({ ok: true, record });
 });
 
-// ===== ASK ENDPOINT =====
+// ===== ASK ENDPOINT (FULL TEXT, NO TRUNCATION) =====
 app.post('/ask', async (req, res) => {
   try {
-    const { question, top_k = 2 } = req.body;
-    if (!question) return res.status(400).json({ error: 'Question required' });
+    const { question } = req.body;
 
+    // Always return only ONE best answer
+    const top_k = 1;
+
+    if (!question) {
+      return res.status(400).json({ error: 'Question required' });
+    }
+
+    // Tokenize user question
     const qTokens = simpleTokenize(question).slice(0, 20);
-    if (qTokens.length === 0) return res.json({ matches: [] });
+    if (qTokens.length === 0) {
+      return res.json({ matches: [] });
+    }
 
+    // Build OR query
     const orParts = [];
     qTokens.forEach(tok => {
       const safe = tok.replace(/%/g, '');
@@ -143,38 +153,64 @@ app.post('/ask', async (req, res) => {
     });
     const orQuery = orParts.join(',');
 
-    const { data, error } = await supabase.from('knowledge_base').select('*').or(orQuery).limit(200);
-    if (error) return res.status(500).json({ error: 'Search failed', detail: error });
+    // Query database
+    const { data, error } = await supabase
+      .from('knowledge_base')
+      .select('*')
+      .or(orQuery)
+      .limit(200);
 
-    const scored = data.map(r => {
-      const hay = ((r.answer_text || '') + ' ' + (r.question_keywords || '') + ' ' + (r.source_document || '')).toLowerCase();
-      let score = 0;
-      qTokens.forEach(tok => {
-        const re = new RegExp(`\\b${tok}\\b`, 'g');
-        const m = hay.match(re);
-        if (m) score += m.length;
-      });
-      return { row: r, score };
-    }).filter(x => x.score > 0).sort((a, b) => b.score - a.score);
+    if (error) {
+      return res.status(500).json({ error: 'Search failed', detail: error });
+    }
 
+    // Score results
+    const scored = data
+      .map(r => {
+        const haystack = (
+          (r.answer_text || '') +
+          ' ' +
+          (r.question_keywords || '') +
+          ' ' +
+          (r.source_document || '')
+        ).toLowerCase();
+
+        let score = 0;
+        qTokens.forEach(tok => {
+          const re = new RegExp(`\\b${tok}\\b`, 'g');
+          const matches = haystack.match(re);
+          if (matches) score += matches.length;
+        });
+
+        return { row: r, score };
+      })
+      .filter(x => x.score > 0)
+      .sort((a, b) => b.score - a.score);
+
+    // Return ONLY the best answer with FULL TEXT
     const best = scored.slice(0, top_k).map(s => {
       const r = s.row;
       return {
         score: s.score,
-        snippet: (r.answer_text || '').slice(0, 8000),
-        lecturer: r.lecturer_name,
-        source: r.source_document,
-        file_url: r.file_url,
+        snippet: r.answer_text || '', // ✅ FULL TEXT, NO CUTTING
+        lecturer: r.lecturer_name || '',
+        source: r.source_document || '',
+        file_url: r.file_url || '',
         id: r.id
       };
     });
 
     res.json({ matches: best });
+
   } catch (err) {
     console.error('[ask] error:', err?.message || err);
-    res.status(500).json({ error: 'Server error', detail: err?.message || String(err) });
+    res.status(500).json({
+      error: 'Server error',
+      detail: err?.message || String(err)
+    });
   }
 });
+
 
 // ===== PROCESS ALL EXISTING BUCKET FILES ON STARTUP =====
 async function processExistingFiles() {
