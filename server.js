@@ -27,7 +27,7 @@ function simpleTokenize(text) {
   if (!text) return [];
   const raw = String(text).toLowerCase().replace(/[^a-z0-9\s]/g, ' ');
   const words = raw.split(/\s+/).filter(Boolean);
-  return Array.from(new Set(words.filter(w => !STOPWORDS.has(w) && w.length > 2))).slice(0, 2000);
+  return Array.from(new Set(words.filter(w => !STOPWORDS.has(w) && w.length > 2))).slice(0, 200);
 }
 
 // Helper: get public URL safely
@@ -128,10 +128,10 @@ app.post('/upload', upload.single('file'), async (req, res) => {
 // ===== ASK ENDPOINT =====
 app.post('/ask', async (req, res) => {
   try {
-    const { question, top_k = 2 } = req.body;
+    const { question, top_k = 3 } = req.body;
     if (!question) return res.status(400).json({ error: 'Question required' });
 
-    const qTokens = simpleTokenize(question).slice(0, 2000);
+    const qTokens = simpleTokenize(question).slice(0, 20);
     if (qTokens.length === 0) return res.json({ matches: [] });
 
     const orParts = [];
@@ -143,7 +143,7 @@ app.post('/ask', async (req, res) => {
     });
     const orQuery = orParts.join(',');
 
-    const { data, error } = await supabase.from('knowledge_base').select('*').or(orQuery).limit(2000);
+    const { data, error } = await supabase.from('knowledge_base').select('*').or(orQuery).limit(200);
     if (error) return res.status(500).json({ error: 'Search failed', detail: error });
 
     const scored = data.map(r => {
@@ -161,7 +161,7 @@ app.post('/ask', async (req, res) => {
       const r = s.row;
       return {
         score: s.score,
-        snippet: (r.answer_text || '').slice(0, 8000),
+        snippet: (r.answer_text || '').slice(0, 800),
         lecturer: r.lecturer_name,
         source: r.source_document,
         file_url: r.file_url,
